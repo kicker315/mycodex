@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
+from collections.abc import Sequence
 
-from PySide6.QtCore import QObject, QProcess, Signal
+from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
 from .redaction import redact_sensitive
 
@@ -16,8 +19,18 @@ class AppServerProcess(QObject):
     stopped = Signal(int, int)
     failed = Signal(str)
 
-    def __init__(self, parent: QObject | None = None):
+    def __init__(
+        self,
+        codex_home: Path | None = None,
+        config_overrides: Sequence[str] = (),
+        env_key: str | None = None,
+        parent: QObject | None = None,
+    ):
         super().__init__(parent)
+        self.codex_home = codex_home.expanduser().resolve() if codex_home else None
+        self.config_overrides = tuple(config_overrides)
+        self.env_key = env_key
+        self._secret_env_value: str | None = None
         self.process = QProcess(self)
         self.process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
         self.process.readyReadStandardOutput.connect(self._read_stdout)
@@ -29,7 +42,20 @@ class AppServerProcess(QObject):
     def start(self) -> None:
         if self.process.state() == QProcess.ProcessState.NotRunning:
             log.info("Starting Codex app-server")
-            self.process.start("codex", ["app-server", "--stdio"])
+            if self.codex_home:
+                # Codex refuses a CODEX_HOME path that does not exist. This
+                # only creates the provider-owned directory; it never writes
+                # the user's existing ~/.codex/config.toml.
+                self.codex_home.mkdir(parents=True, exist_ok=True)
+                environment = QProcessEnvironment.systemEnvironment()
+                environment.insert("CODEX_HOME", str(self.codex_home))
+                if self.env_key and self._secret_env_value is not None:
+                    environment.insert(self.env_key, self._secret_env_value)
+                self.process.setProcessEnvironment(environment)
+            arguments = ["app-server", "--stdio"]
+            for override in self.config_overrides:
+                arguments.extend(("-c", override))
+            self.process.start("codex", arguments)
 
     @property
     def is_running(self) -> bool:
@@ -39,6 +65,17 @@ class AppServerProcess(QObject):
         if self.process.state() != QProcess.ProcessState.Running:
             raise RuntimeError("Codex app-server is not running")
         self.process.write(data)
+
+    def set_secret_env_value(self, value: str | None) -> None:
+        """Set an in-memory environment override; never put it in argv or config."""
+
+        self._secret_env_value = value if value else None
+
+    def redact(self, text: str) -> str:
+        secrets = [os.environ.get(self.env_key, "")] if self.env_key else []
+        if self._secret_env_value:
+            secrets.append(self._secret_env_value)
+        return redact_sensitive(text, secrets)
 
     def stop(self, timeout_ms: int = 3000) -> None:
         if self.process.state() == QProcess.ProcessState.NotRunning:
@@ -60,7 +97,7 @@ class AppServerProcess(QObject):
     def _read_stderr(self) -> None:
         text = bytes(self.process.readAllStandardError()).decode("utf-8", "replace").rstrip()
         if text:
-            safe_text = redact_sensitive(text)
+            safe_text = self.redact(text)
             log.warning("app-server stderr: %s", safe_text)
             self.stderr_received.emit(safe_text)
 

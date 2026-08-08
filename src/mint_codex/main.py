@@ -5,14 +5,14 @@ import sys
 
 from PySide6.QtWidgets import QApplication
 
-from .core.controller import CodexController
 from .ui.main_window import MainWindow
+from .workspace.controller import WorkspaceController
 
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     app = QApplication(sys.argv)
-    controller = CodexController()
+    controller = WorkspaceController()
     window = MainWindow(controller)
     window.show()
     controller.start()

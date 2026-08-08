@@ -9,3 +9,7 @@ def test_sensitive_credentials_are_redacted():
     assert "xyz789" not in safe
     assert safe.count("[REDACTED]") >= 3
     assert "harmless=value" in safe
+
+
+def test_explicit_process_secret_is_redacted():
+    assert redact_sensitive("provider diagnostics: raw-secret", ["raw-secret"]) == "provider diagnostics: [REDACTED]"
