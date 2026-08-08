@@ -9,8 +9,17 @@ from PySide6.QtCore import Signal
 
 from mint_codex.core.provider_router import ProviderRouter
 from mint_codex.models.agent_task import AgentTask, AgentTaskStatus
+from mint_codex.models.orchestration import (
+    OrchestrationNode,
+    OrchestrationNodeStatus,
+    OrchestrationRun,
+    OrchestrationRunStatus,
+    ResultEnvelope,
+)
 from mint_codex.models.session import Item, Thread, ThreadSummary, Turn
 from mint_codex.models.timeline import ApprovalRequest
+from mint_codex.orchestration.plan import parse_plan_payload, validate_plan
+from mint_codex.orchestration.scheduler import OrchestrationScheduler
 
 from .registry import Project, ProjectRegistry
 from .state import WorkspaceContext, WorkspaceContextKind, WorkspaceState
@@ -49,6 +58,10 @@ class WorkspaceController(ProviderRouter):
     agent_task_selected = Signal(object, object)
     agent_task_timeline_event = Signal(str, str, object)
     agent_task_approval_requested = Signal(object)
+    orchestration_runs_changed = Signal(object)
+    orchestration_run_changed = Signal(object)
+    orchestration_node_changed = Signal(object)
+    orchestration_plan_ready = Signal(object)
 
     def __init__(
         self,
@@ -74,7 +87,12 @@ class WorkspaceController(ProviderRouter):
         self._agent_task_by_thread: dict[tuple[str, str], str] = {}
         self._pending_agent_starts: set[str] = set()
         self._pending_agent_recovery: set[str] = set()
+        self._orchestration_runs: dict[str, OrchestrationRun] = {}
+        self._orchestration_nodes: dict[str, dict[str, OrchestrationNode]] = {}
+        self._planner_tasks: dict[str, str] = {}
+        self._orchestration_scheduler = OrchestrationScheduler()
         self._load_agent_tasks()
+        self._load_orchestrations()
         saved_task_id = self.registry.get_active_workspace_task_id()
         self._pending_resume: tuple[str, str] | None = None
         self._history_loading = False
@@ -144,6 +162,243 @@ class WorkspaceController(ProviderRouter):
 
     def agent_task(self, task_id: str) -> AgentTask | None:
         return self._agent_tasks.get(task_id)
+
+    @property
+    def orchestration_runs(self) -> list[OrchestrationRun]:
+        project_id = self.state.active_project_id
+        return [
+            run
+            for run in self._orchestration_runs.values()
+            if run.project_id == project_id
+        ]
+
+    def orchestration_runs_for_project(self, project_id: str) -> list[OrchestrationRun]:
+        return [run for run in self._orchestration_runs.values() if run.project_id == project_id]
+
+    def orchestration_run(self, run_id: str) -> OrchestrationRun | None:
+        return self._orchestration_runs.get(run_id)
+
+    def orchestration_nodes(self, run_id: str) -> list[OrchestrationNode]:
+        return list(self._orchestration_nodes.get(run_id, {}).values())
+
+    def create_orchestration_run(
+        self,
+        objective: str,
+        *,
+        project_id: str | None = None,
+        default_provider_id: str | None = None,
+        default_model_id: str | None = None,
+        max_parallelism: int = 2,
+    ) -> OrchestrationRun | None:
+        project = self.registry.get_project(project_id) if project_id is not None else self.active_project
+        objective = objective.strip()
+        provider_id = default_provider_id or self.selected_provider
+        model_id = default_model_id if default_model_id is not None else self._selected_models.get(provider_id)
+        if project is None:
+            self.error.emit("Add or open a Project before creating an Orchestration Run")
+            return None
+        if not objective:
+            self.error.emit("Orchestration objective cannot be empty")
+            return None
+        if len(objective) > 8000:
+            self.error.emit("Orchestration objective is too long")
+            return None
+        if provider_id not in self.backends:
+            self.error.emit(f"Unknown Provider: {provider_id}")
+            return None
+        if not 1 <= int(max_parallelism) <= 8:
+            self.error.emit("Orchestration parallelism must be between 1 and 8")
+            return None
+        try:
+            self.worktree_manager.validate_repository(project.path)
+            base_commit = self.worktree_manager.resolve_commit(project.path)
+        except WorktreeError as exc:
+            self.error.emit(str(exc))
+            return None
+        run = OrchestrationRun(
+            run_id=str(uuid.uuid4()),
+            project_id=project.id,
+            objective=objective,
+            base_commit=base_commit,
+            default_provider_id=provider_id,
+            default_model_id=model_id,
+            max_parallelism=int(max_parallelism),
+        )
+        self._orchestration_runs[run.run_id] = run
+        self._orchestration_nodes[run.run_id] = {}
+        self.registry.upsert_orchestration(run, [])
+        self._emit_orchestration_runs()
+        self.orchestration_run_changed.emit(run)
+        return run
+
+    def set_orchestration_plan(self, run_id: str, payload: object):
+        run = self._orchestration_runs.get(run_id)
+        if run is None:
+            self.error.emit(f"Unknown Orchestration Run: {run_id}")
+            return validate_plan((), provider_ids=self.provider_ids)
+        if run.plan_frozen:
+            self.error.emit("Approved Orchestration Plans are immutable")
+            return validate_plan((), provider_ids=self.provider_ids)
+        parsed = parse_plan_payload(payload)
+        if not parsed.valid:
+            self.error.emit("Plan validation failed: " + "; ".join(parsed.errors))
+            return parsed
+        nodes = [
+            replace(
+                node,
+                run_id=run_id,
+                provider_id=node.provider_id or run.default_provider_id,
+                model_id=node.model_id if node.model_id is not None else run.default_model_id,
+            )
+            for node in parsed.nodes
+        ]
+        validated = validate_plan(
+            nodes,
+            provider_ids=self.provider_ids,
+            known_models=self._orchestration_model_catalog(),
+        )
+        if not validated.valid:
+            self.error.emit("Plan validation failed: " + "; ".join(validated.errors))
+            return validated
+        if run.status == OrchestrationRunStatus.VALIDATED:
+            run.transition_to(OrchestrationRunStatus.DRAFT)
+        if self._orchestration_nodes.get(run_id):
+            run.plan_version += 1
+        self._orchestration_nodes[run_id] = {node.node_id: node for node in nodes}
+        self.registry.upsert_orchestration(run, nodes)
+        self.orchestration_run_changed.emit(run)
+        self.orchestration_node_changed.emit(tuple(nodes))
+        return validated
+
+    def validate_orchestration_run(self, run_id: str):
+        run = self._orchestration_runs.get(run_id)
+        nodes = self.orchestration_nodes(run_id)
+        if run is None:
+            return validate_plan((), provider_ids=self.provider_ids)
+        validation = validate_plan(
+            nodes,
+            provider_ids=self.provider_ids,
+            known_models=self._orchestration_model_catalog(),
+        )
+        run.metadata = {**run.metadata, "validation_errors": list(validation.errors)}
+        if validation.valid and run.status == OrchestrationRunStatus.DRAFT:
+            run.transition_to(OrchestrationRunStatus.VALIDATED)
+        self._persist_orchestration(run_id)
+        self.orchestration_run_changed.emit(run)
+        return validation
+
+    def approve_orchestration_run(self, run_id: str) -> bool:
+        run = self._orchestration_runs.get(run_id)
+        validation = self.validate_orchestration_run(run_id)
+        if run is None or not validation.valid or run.status != OrchestrationRunStatus.VALIDATED:
+            self.error.emit("Only a valid Plan Draft can be approved")
+            return False
+        try:
+            run.transition_to(OrchestrationRunStatus.APPROVED)
+        except ValueError as exc:
+            self.error.emit(str(exc))
+            return False
+        self._persist_orchestration(run_id)
+        self.orchestration_run_changed.emit(run)
+        return True
+
+    def start_orchestration_run(self, run_id: str) -> bool:
+        run = self._orchestration_runs.get(run_id)
+        if run is None:
+            self.error.emit(f"Unknown Orchestration Run: {run_id}")
+            return False
+        if run.status != OrchestrationRunStatus.APPROVED:
+            self.error.emit("Orchestration Run must be approved before it can start")
+            return False
+        project = self.registry.get_project(run.project_id)
+        if project is None:
+            run.transition_to(OrchestrationRunStatus.FAILED, error="Orchestration Project is missing")
+            self._persist_orchestration(run_id)
+            self.error.emit("Orchestration Project is missing")
+            return False
+        try:
+            current_commit = self.worktree_manager.resolve_commit(project.path, run.base_commit)
+        except WorktreeError as exc:
+            run.transition_to(OrchestrationRunStatus.FAILED, error=str(exc))
+            self._persist_orchestration(run_id)
+            self.error.emit(str(exc))
+            return False
+        if current_commit != run.base_commit:
+            run.transition_to(
+                OrchestrationRunStatus.FAILED,
+                error="Fixed Orchestration base commit is no longer available",
+            )
+            self._persist_orchestration(run_id)
+            self.error.emit("Orchestration base commit is no longer available")
+            return False
+        run.transition_to(OrchestrationRunStatus.RUNNING)
+        self._persist_orchestration(run_id)
+        self.orchestration_run_changed.emit(run)
+        self._schedule_orchestration(run_id)
+        return True
+
+    def pause_orchestration_run(self, run_id: str) -> bool:
+        run = self._orchestration_runs.get(run_id)
+        if run is None or run.status != OrchestrationRunStatus.RUNNING:
+            return False
+        run.transition_to(OrchestrationRunStatus.PAUSED)
+        self._persist_orchestration(run_id)
+        self.orchestration_run_changed.emit(run)
+        return True
+
+    def resume_orchestration_run(self, run_id: str) -> bool:
+        run = self._orchestration_runs.get(run_id)
+        if run is None or run.status not in {OrchestrationRunStatus.PAUSED, OrchestrationRunStatus.RECOVERY_REQUIRED}:
+            return False
+        if not self._orchestration_recovery_is_safe(run_id):
+            self.error.emit("Orchestration recovery is not safe; inspect the affected AgentTask Worktree")
+            return False
+        run.transition_to(OrchestrationRunStatus.RUNNING)
+        self._persist_orchestration(run_id)
+        self.orchestration_run_changed.emit(run)
+        self._schedule_orchestration(run_id)
+        return True
+
+    def cancel_orchestration_node(self, run_id: str, node_id: str) -> bool:
+        run = self._orchestration_runs.get(run_id)
+        node = self._orchestration_nodes.get(run_id, {}).get(node_id)
+        if run is None or node is None or run.status in {
+            OrchestrationRunStatus.COMPLETED,
+            OrchestrationRunStatus.PARTIAL_FAILED,
+            OrchestrationRunStatus.CANCELLED,
+            OrchestrationRunStatus.FAILED,
+        }:
+            return False
+        if node.agent_task_id:
+            self.cancel_agent_task(node.agent_task_id)
+        elif node.status in {OrchestrationNodeStatus.PENDING, OrchestrationNodeStatus.READY}:
+            node.transition_to(OrchestrationNodeStatus.CANCELLED, blocked_reason="Cancelled by user")
+            self._persist_orchestration(run_id)
+            self.orchestration_node_changed.emit(node)
+            self._schedule_orchestration(run_id)
+        return True
+
+    def cancel_orchestration_run(self, run_id: str) -> bool:
+        run = self._orchestration_runs.get(run_id)
+        if run is None or run.status in {
+            OrchestrationRunStatus.COMPLETED,
+            OrchestrationRunStatus.PARTIAL_FAILED,
+            OrchestrationRunStatus.CANCELLED,
+            OrchestrationRunStatus.FAILED,
+        }:
+            return False
+        for node in self.orchestration_nodes(run_id):
+            if node.agent_task_id:
+                task = self._agent_tasks.get(node.agent_task_id)
+                if task is not None and task.is_running:
+                    self.cancel_agent_task(task.id)
+            elif node.status in {OrchestrationNodeStatus.PENDING, OrchestrationNodeStatus.READY}:
+                node.transition_to(OrchestrationNodeStatus.CANCELLED, blocked_reason="Run cancelled")
+        run.transition_to(OrchestrationRunStatus.CANCELLED, reason="Cancelled by user")
+        self._persist_orchestration(run_id)
+        self.orchestration_run_changed.emit(run)
+        self.orchestration_node_changed.emit(tuple(self.orchestration_nodes(run_id)))
+        return True
 
     @property
     def current_thread(self) -> Thread | None:
@@ -273,8 +528,12 @@ class WorkspaceController(ProviderRouter):
         provider_id: str | None = None,
         model_id: str | None = None,
         reasoning_effort: str | None = None,
+        project_id: str | None = None,
+        base_commit: str | None = None,
+        auto_start: bool = True,
+        activate: bool = True,
     ) -> AgentTask | None:
-        project = self.active_project
+        project = self.registry.get_project(project_id) if project_id is not None else self.active_project
         title = " ".join(title.split())
         task_prompt = task_prompt.strip()
         provider_id = provider_id or self.selected_provider
@@ -294,6 +553,7 @@ class WorkspaceController(ProviderRouter):
             return None
         try:
             self.worktree_manager.validate_repository(project.path)
+            resolved_base_commit = self.worktree_manager.resolve_commit(project.path, base_commit or "HEAD")
             task_id = str(uuid.uuid4())
             worktree_path = self.worktree_manager.task_path(project.id, task_id)
             branch_name = self.worktree_manager.branch_name(project.id, task_id)
@@ -312,21 +572,23 @@ class WorkspaceController(ProviderRouter):
             thread_id=None,
             worktree_path=worktree_path,
             branch_name=branch_name,
+            base_commit=resolved_base_commit,
         )
         self._agent_tasks[task.id] = task
         self.registry.upsert_agent_task(task)
         self._emit_agent_tasks()
         try:
-            self.worktree_manager.create(project.path, project.id, task.id)
+            self.worktree_manager.create(project.path, project.id, task.id, resolved_base_commit)
             self._set_task_status(task, AgentTaskStatus.READY)
         except WorktreeError as exc:
             self._set_task_status(task, AgentTaskStatus.FAILED, error=str(exc))
             self.error.emit(f"Agent Task worktree creation failed: {exc}")
             return task
-        self.start_agent_task(task.id)
+        if auto_start:
+            self.start_agent_task(task.id, activate=activate)
         return task
 
-    def start_agent_task(self, task_id: str) -> bool:
+    def start_agent_task(self, task_id: str, *, activate: bool = True) -> bool:
         task = self._agent_tasks.get(task_id)
         if task is None:
             self._fail(f"Unknown Agent Task: {task_id}")
@@ -357,7 +619,8 @@ class WorkspaceController(ProviderRouter):
         if backend is None:
             self._set_task_status(task, AgentTaskStatus.FAILED, error="Provider backend unavailable")
             return False
-        self.activate_agent_task(task.id, source="start-agent-task")
+        if activate and not self.activate_agent_task(task.id, source="start-agent-task"):
+            return False
         if not backend.is_ready:
             self._pending_agent_starts.add(task.id)
             if not backend.is_running:
@@ -641,9 +904,349 @@ class WorkspaceController(ProviderRouter):
                     task.completion_metadata = {**task.completion_metadata, "recovery_error": "Missing Worktree"}
                     self.registry.upsert_agent_task(task)
 
+    def _load_orchestrations(self) -> None:
+        for project in self.registry.list_projects():
+            for saved_run in self.registry.list_orchestrations(project.id):
+                run, nodes = self.registry.get_orchestration(saved_run.run_id)
+                if run is None:
+                    continue
+                if run.status == OrchestrationRunStatus.RUNNING:
+                    run.status = OrchestrationRunStatus.RECOVERY_REQUIRED
+                    run.metadata = {
+                        **run.metadata,
+                        "recovery_error": "Application restarted while the Run was active",
+                    }
+                self._orchestration_runs[run.run_id] = run
+                self._orchestration_nodes[run.run_id] = {node.node_id: node for node in nodes}
+                planner_task_id = run.metadata.get("planner_task_id")
+                if isinstance(planner_task_id, str):
+                    self._planner_tasks[planner_task_id] = run.run_id
+                for node in nodes:
+                    if node.agent_task_id is None:
+                        continue
+                    task = self._agent_tasks.get(node.agent_task_id)
+                    if task is None:
+                        node.status = OrchestrationNodeStatus.FAILED
+                        node.blocked_reason = "Bound AgentTask is missing"
+                        run.metadata = {**run.metadata, "recovery_error": "Bound AgentTask is missing"}
+                self._persist_orchestration(run.run_id)
+        for task_id, run_id in list(self._planner_tasks.items()):
+            task = self._agent_tasks.get(task_id)
+            if task is not None and task.status == AgentTaskStatus.COMPLETED:
+                self._handle_planner_task(task, run_id)
+        for run_id, nodes in self._orchestration_nodes.items():
+            for node in nodes.values():
+                if node.agent_task_id:
+                    task = self._agent_tasks.get(node.agent_task_id)
+                    if task is not None:
+                        self._sync_orchestration_task(task)
+
+    def _emit_orchestration_runs(self) -> None:
+        self.orchestration_runs_changed.emit(self.orchestration_runs)
+
+    def _persist_orchestration(self, run_id: str) -> None:
+        run = self._orchestration_runs.get(run_id)
+        if run is None:
+            return
+        nodes = self.orchestration_nodes(run_id)
+        self.registry.upsert_orchestration(run, nodes)
+        self.orchestration_run_changed.emit(run)
+        self.orchestration_node_changed.emit(tuple(nodes))
+        self._emit_orchestration_runs()
+
+    def _orchestration_model_catalog(self) -> dict[str, set[str]]:
+        catalog: dict[str, set[str]] = {}
+        for provider_id, config in self.providers.items():
+            models = {value for value in (config.model, self._selected_models.get(provider_id)) if value}
+            models.update(
+                item.get("model")
+                for item in self._models.get(provider_id, [])
+                if isinstance(item, dict) and isinstance(item.get("model"), str)
+            )
+            catalog[provider_id] = models
+        return catalog
+
+    def _schedule_orchestration(self, run_id: str) -> None:
+        run = self._orchestration_runs.get(run_id)
+        if run is None or run.status not in {OrchestrationRunStatus.RUNNING, OrchestrationRunStatus.PAUSED}:
+            return
+        nodes = self.orchestration_nodes(run_id)
+        running_ids = {
+            node.node_id
+            for node in nodes
+            if node.status in {OrchestrationNodeStatus.STARTING, OrchestrationNodeStatus.RUNNING}
+        }
+        decision = self._orchestration_scheduler.decide(
+            nodes,
+            max_parallelism=run.max_parallelism,
+            running_node_ids=running_ids,
+            paused=run.status == OrchestrationRunStatus.PAUSED,
+        )
+        for node_id in decision.blocked_node_ids:
+            node = self._orchestration_nodes[run_id][node_id]
+            if node.status in {OrchestrationNodeStatus.PENDING, OrchestrationNodeStatus.READY}:
+                node.transition_to(
+                    OrchestrationNodeStatus.BLOCKED,
+                    blocked_reason="An upstream node failed or was cancelled",
+                )
+        for node_id in decision.start_node_ids:
+            self._start_orchestration_node(run, self._orchestration_nodes[run_id][node_id])
+        self._persist_orchestration(run_id)
+        self._recompute_orchestration(run_id)
+
+    def _start_orchestration_node(self, run: OrchestrationRun, node: OrchestrationNode) -> None:
+        if node.status == OrchestrationNodeStatus.PENDING:
+            node.transition_to(OrchestrationNodeStatus.READY)
+        if node.agent_task_id:
+            task = self._agent_tasks.get(node.agent_task_id)
+        else:
+            task_prompt = self._node_prompt_with_results(run, node)
+            task = self.create_agent_task(
+                node.title,
+                task_prompt,
+                provider_id=node.provider_id or run.default_provider_id,
+                model_id=node.model_id,
+                project_id=run.project_id,
+                base_commit=run.base_commit,
+                auto_start=False,
+                activate=False,
+            )
+            if task is not None:
+                node.bind_task(task.id)
+        if task is None:
+            node.transition_to(OrchestrationNodeStatus.FAILED, blocked_reason="AgentTask creation failed")
+            return
+        if task.status in {AgentTaskStatus.COMPLETED, AgentTaskStatus.FAILED, AgentTaskStatus.CANCELLED, AgentTaskStatus.ORPHANED}:
+            self._sync_orchestration_task(task)
+            return
+        if node.status in {OrchestrationNodeStatus.PENDING, OrchestrationNodeStatus.READY}:
+            node.transition_to(OrchestrationNodeStatus.STARTING)
+        started = self.start_agent_task(task.id, activate=False)
+        if not started and task.status == AgentTaskStatus.READY:
+            node.transition_to(
+                OrchestrationNodeStatus.READY,
+                blocked_reason="Waiting for the shared AgentTask concurrency limit",
+            )
+
+    @staticmethod
+    def _node_prompt(run: OrchestrationRun, node: OrchestrationNode) -> str:
+        capability = f"Capability hint: {node.capability_hint}\n" if node.capability_hint else ""
+        return (
+            f"You are Worker AgentTask node {node.node_id} for a supervised orchestration.\n"
+            f"Objective: {run.objective}\n"
+            f"{capability}"
+            f"Instructions: {node.instructions}\n"
+            "Work only in the isolated Worktree supplied by the AgentTask runtime. "
+            "Do not modify a main workspace, merge upstream changes, or communicate directly with other Agents."
+        )
+
+    def _node_prompt_with_results(self, run: OrchestrationRun, node: OrchestrationNode) -> str:
+        parts = [self._node_prompt(run, node)]
+        results = self._orchestration_nodes.get(run.run_id, {})
+        upstream = [results[dependency].result for dependency in node.dependencies if results.get(dependency)]
+        if upstream:
+            parts.append("\nRESULT_ONLY upstream summaries (not code or workspace authority):\n")
+            parts.extend(result.prompt_context() for result in upstream if result is not None)
+        return "\n".join(parts)[:16000]
+
+    def generate_orchestration_plan(self, run_id: str) -> AgentTask | None:
+        run = self._orchestration_runs.get(run_id)
+        if run is None or run.status != OrchestrationRunStatus.DRAFT:
+            self.error.emit("Planner can only generate a Plan Draft")
+            return None
+        planner_prompt = (
+            "You are a read-only planning assistant. Do not edit files, create commits, or choose a cwd.\n"
+            "Return ONLY strict JSON with this shape: "
+            '{"nodes":[{"node_id":"a","title":"...","instructions":"...",'
+            '"dependencies":[],"provider_id":null,"model_id":null,"capability_hint":null}]}\n'
+            f"Objective: {run.objective}\n"
+            "Use only node_id, title, instructions, dependencies, provider_id, model_id, and capability_hint. "
+            "Never include cwd, path, branch, worktree_path, or base_commit."
+        )
+        task = self.create_agent_task(
+            f"Planner · {run.run_id[:8]}",
+            planner_prompt,
+            provider_id=run.default_provider_id,
+            model_id=run.default_model_id,
+            project_id=run.project_id,
+            base_commit=run.base_commit,
+            auto_start=True,
+            activate=False,
+        )
+        if task is None:
+            return None
+        self._planner_tasks[task.id] = run_id
+        run.metadata = {**run.metadata, "planner_task_id": task.id}
+        self._persist_orchestration(run_id)
+        return task
+
+    def _handle_planner_task(self, task: AgentTask, run_id: str) -> None:
+        run = self._orchestration_runs.get(run_id)
+        if run is None:
+            return
+        if task.status == AgentTaskStatus.COMPLETED:
+            if run.metadata.get("planner_completed"):
+                return
+            run.metadata = {**run.metadata, "planner_completed": True}
+            raw = task.completion_metadata.get("final_message")
+            try:
+                import json
+
+                payload = json.loads(raw) if isinstance(raw, str) else None
+            except (TypeError, ValueError):
+                payload = None
+            validation = self.set_orchestration_plan(run_id, payload)
+            if not validation.valid:
+                run.metadata = {**run.metadata, "planner_error": "; ".join(validation.errors)}
+                self._persist_orchestration(run_id)
+                return
+            self.orchestration_plan_ready.emit({"run_id": run_id, "nodes": self.orchestration_nodes(run_id)})
+        elif task.status in {AgentTaskStatus.FAILED, AgentTaskStatus.CANCELLED, AgentTaskStatus.ORPHANED}:
+            run.metadata = {
+                **run.metadata,
+                "planner_error": task.completion_metadata.get("error", task.status.value),
+            }
+            self._persist_orchestration(run_id)
+
     def _emit_agent_tasks(self) -> None:
         tasks = self.agent_tasks
         self.agent_tasks_changed.emit(tasks)
+
+    def _sync_orchestration_task(self, task: AgentTask) -> None:
+        if task.id in self._planner_tasks:
+            self._handle_planner_task(task, self._planner_tasks[task.id])
+        affected: list[tuple[OrchestrationRun, OrchestrationNode]] = []
+        for run in self._orchestration_runs.values():
+            node = next(
+                (item for item in self._orchestration_nodes.get(run.run_id, {}).values() if item.agent_task_id == task.id),
+                None,
+            )
+            if node is not None:
+                affected.append((run, node))
+        for run, node in affected:
+            if task.status in {AgentTaskStatus.RUNNING, AgentTaskStatus.WAITING_APPROVAL}:
+                if node.status in {OrchestrationNodeStatus.STARTING, OrchestrationNodeStatus.READY}:
+                    node.transition_to(OrchestrationNodeStatus.RUNNING)
+            elif task.status == AgentTaskStatus.COMPLETED:
+                result = self._result_envelope(node, task)
+                if node.status not in {
+                    OrchestrationNodeStatus.SUCCEEDED,
+                    OrchestrationNodeStatus.FAILED,
+                    OrchestrationNodeStatus.CANCELLED,
+                    OrchestrationNodeStatus.BLOCKED,
+                }:
+                    node.transition_to(OrchestrationNodeStatus.SUCCEEDED, result=result)
+                node.result = result
+            elif task.status == AgentTaskStatus.FAILED:
+                result = self._result_envelope(node, task)
+                if node.status not in {
+                    OrchestrationNodeStatus.SUCCEEDED,
+                    OrchestrationNodeStatus.FAILED,
+                    OrchestrationNodeStatus.CANCELLED,
+                    OrchestrationNodeStatus.BLOCKED,
+                }:
+                    node.transition_to(OrchestrationNodeStatus.FAILED, result=result)
+                node.result = result
+            elif task.status == AgentTaskStatus.CANCELLED:
+                result = self._result_envelope(node, task)
+                if node.status not in {
+                    OrchestrationNodeStatus.SUCCEEDED,
+                    OrchestrationNodeStatus.FAILED,
+                    OrchestrationNodeStatus.CANCELLED,
+                    OrchestrationNodeStatus.BLOCKED,
+                }:
+                    node.transition_to(OrchestrationNodeStatus.CANCELLED, result=result)
+                node.result = result
+            elif task.status == AgentTaskStatus.ORPHANED:
+                if node.status not in {
+                    OrchestrationNodeStatus.SUCCEEDED,
+                    OrchestrationNodeStatus.FAILED,
+                    OrchestrationNodeStatus.CANCELLED,
+                    OrchestrationNodeStatus.BLOCKED,
+                }:
+                    node.transition_to(
+                        OrchestrationNodeStatus.FAILED,
+                        blocked_reason="AgentTask Worktree is missing or unusable",
+                    )
+            self._persist_orchestration(run.run_id)
+            if run.status in {OrchestrationRunStatus.RUNNING, OrchestrationRunStatus.PAUSED}:
+                self._schedule_orchestration(run.run_id)
+            else:
+                self._recompute_orchestration(run.run_id)
+
+    @staticmethod
+    def _result_envelope(node: OrchestrationNode, task: AgentTask) -> ResultEnvelope:
+        metadata = task.completion_metadata
+        changed_files = metadata.get("changed_files", ())
+        if not isinstance(changed_files, (list, tuple)):
+            changed_files = ()
+        return ResultEnvelope(
+            node_id=node.node_id,
+            agent_task_id=task.id,
+            terminal_status=task.status.value,
+            final_message=str(metadata.get("final_message") or "")[:12000],
+            changed_files=tuple(value for value in changed_files if isinstance(value, str))[:100],
+            branch_name=task.branch_name,
+            worktree_reference=str(task.worktree_path),
+            error_summary=str(metadata.get("error")) if metadata.get("error") else None,
+            started_at=task.created_at,
+            completed_at=task.updated_at,
+        )
+
+    def _recompute_orchestration(self, run_id: str) -> None:
+        run = self._orchestration_runs.get(run_id)
+        if run is None or run.status in {
+            OrchestrationRunStatus.COMPLETED,
+            OrchestrationRunStatus.PARTIAL_FAILED,
+            OrchestrationRunStatus.CANCELLED,
+            OrchestrationRunStatus.FAILED,
+        }:
+            return
+        nodes = self.orchestration_nodes(run_id)
+        if not nodes or not all(
+            node.status
+            in {
+                OrchestrationNodeStatus.SUCCEEDED,
+                OrchestrationNodeStatus.FAILED,
+                OrchestrationNodeStatus.CANCELLED,
+                OrchestrationNodeStatus.BLOCKED,
+            }
+            for node in nodes
+        ):
+            return
+        if all(node.status == OrchestrationNodeStatus.SUCCEEDED for node in nodes):
+            target = OrchestrationRunStatus.COMPLETED
+        elif any(node.status == OrchestrationNodeStatus.FAILED for node in nodes) or any(
+            node.status == OrchestrationNodeStatus.BLOCKED for node in nodes
+        ):
+            target = (
+                OrchestrationRunStatus.PARTIAL_FAILED
+                if any(node.status == OrchestrationNodeStatus.SUCCEEDED for node in nodes)
+                else OrchestrationRunStatus.FAILED
+            )
+        else:
+            target = OrchestrationRunStatus.CANCELLED
+        try:
+            run.transition_to(target)
+        except ValueError:
+            run.status = target
+        self._persist_orchestration(run_id)
+
+    def _orchestration_recovery_is_safe(self, run_id: str) -> bool:
+        run = self._orchestration_runs.get(run_id)
+        if run is None:
+            return False
+        for node in self.orchestration_nodes(run_id):
+            if not node.agent_task_id:
+                continue
+            task = self._agent_tasks.get(node.agent_task_id)
+            project = self.registry.get_project(run.project_id)
+            if task is None or project is None or task.status == AgentTaskStatus.ORPHANED:
+                return False
+            inspection = self.worktree_manager.inspect(project.path, project.id, task.id, task.branch_name)
+            if not inspection.usable:
+                return False
+        return True
 
     def _set_task_status(self, task: AgentTask, status: AgentTaskStatus, **metadata: object) -> None:
         try:
@@ -658,6 +1261,7 @@ class WorkspaceController(ProviderRouter):
         self.registry.upsert_agent_task(task)
         self.agent_task_changed.emit(task)
         self._emit_agent_tasks()
+        self._sync_orchestration_task(task)
 
     def _running_agent_count(self) -> int:
         return sum(1 for task in self._agent_tasks.values() if task.is_running)
@@ -853,6 +1457,25 @@ class WorkspaceController(ProviderRouter):
                 return
         super()._on_backend_notification(provider_id, method, params)
 
+    @staticmethod
+    def _task_completion_metadata(runtime: _AgentRuntime) -> dict[str, object]:
+        messages = [item.text for item in runtime.items.values() if item.type == "agentMessage" and item.text]
+        changed_files: set[str] = set()
+        for item in runtime.items.values():
+            if item.type != "fileChange":
+                continue
+            changes = item.data.get("changes", [])
+            if not isinstance(changes, list):
+                continue
+            for change in changes:
+                if isinstance(change, dict) and isinstance(change.get("path"), str):
+                    changed_files.add(change["path"])
+        metadata: dict[str, object] = {
+            "final_message": (messages[-1] if messages else "")[:12000],
+            "changed_files": sorted(changed_files)[:100],
+        }
+        return metadata
+
     def _handle_agent_notification(self, task_id: str, provider_id: str, method: str, params: dict) -> None:
         task = self._agent_tasks.get(task_id)
         runtime = self._agent_runtimes.get(task_id)
@@ -942,15 +1565,37 @@ class WorkspaceController(ProviderRouter):
             task.active_turn_id = None
             if runtime.cancel_requested or task.status == AgentTaskStatus.CANCELLED or status == "interrupted":
                 if runtime.cancel_requested or task.status == AgentTaskStatus.CANCELLED:
-                    self._set_task_status(task, AgentTaskStatus.CANCELLED, turn_status=status)
+                    self._set_task_status(
+                        task,
+                        AgentTaskStatus.CANCELLED,
+                        turn_status=status,
+                        **self._task_completion_metadata(runtime),
+                    )
                 else:
-                    self._set_task_status(task, AgentTaskStatus.FAILED, error="Turn interrupted", turn_status=status)
+                    self._set_task_status(
+                        task,
+                        AgentTaskStatus.FAILED,
+                        error="Turn interrupted",
+                        turn_status=status,
+                        **self._task_completion_metadata(runtime),
+                    )
             elif status == "completed":
-                self._set_task_status(task, AgentTaskStatus.COMPLETED, turn_status=status)
+                self._set_task_status(
+                    task,
+                    AgentTaskStatus.COMPLETED,
+                    turn_status=status,
+                    **self._task_completion_metadata(runtime),
+                )
             else:
                 details = data.get("error") or data.get("lastError") or "Codex did not complete this turn"
                 message = details.get("message", details) if isinstance(details, dict) else str(details)
-                self._set_task_status(task, AgentTaskStatus.FAILED, error=message, turn_status=status)
+                self._set_task_status(
+                    task,
+                    AgentTaskStatus.FAILED,
+                    error=message,
+                    turn_status=status,
+                    **self._task_completion_metadata(runtime),
+                )
             self.registry.upsert_agent_task(task)
             self._task_timeline(task_id, "turn_completed", data)
         elif method == "error":

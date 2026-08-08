@@ -45,3 +45,7 @@ pytest -q
 `+ New Agent Task` creates a client-owned Agent Task with its own branch and Git worktree under `~/.local/share/mint-codex/worktrees/<project-id>/<task-id>/`. The task prompt starts one Thread with `cwd` fixed to that worktree. Provider-level App Server processes are reused; notifications and approvals are routed by `(provider, thread_id)` and then by task id.
 
 The active workspace context is either the Project's Main Workspace or one Agent Task worktree. Git status, diff, file preview, terminal, timeline, and new turns derive their root from that context. Agent Task completion never merges, commits, pushes, or removes a worktree. Cleanup is explicit and refuses dirty worktrees, active turns, or active terminals.
+
+## MVP-5B supervised orchestration
+
+`+ New Orchestration` creates a human-supervised Plan Draft. The user edits and validates a bounded DAG, approves it explicitly, and then starts deterministic scheduling. Independent nodes run as ordinary MVP-5A AgentTasks from one fixed base commit; dependent nodes receive bounded result summaries only. Pause stops new scheduling, while Cancel is scoped to the selected node or Run. Runs and node-to-AgentTask mappings are persisted and recover into a review-required state after restart. No automatic merge, commit, retry, replan, patch application, or cleanup is performed.

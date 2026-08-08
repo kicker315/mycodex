@@ -10,6 +10,13 @@ from typing import Iterable
 
 from mint_codex.models.session import ThreadSummary
 from mint_codex.models.agent_task import AgentTask, AgentTaskStatus
+from mint_codex.models.orchestration import (
+    OrchestrationNode,
+    OrchestrationNodeStatus,
+    OrchestrationRun,
+    OrchestrationRunStatus,
+    ResultEnvelope,
+)
 
 
 @dataclass(frozen=True)
@@ -81,7 +88,8 @@ class ProjectRegistry:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 completion_metadata TEXT NOT NULL DEFAULT '{}',
-                active_turn_id TEXT
+                active_turn_id TEXT,
+                base_commit TEXT
             );
             CREATE INDEX IF NOT EXISTS agent_tasks_by_project_activity
                 ON agent_tasks(project_id, status, updated_at DESC);
@@ -89,8 +97,46 @@ class ProjectRegistry:
                 key TEXT PRIMARY KEY,
                 value TEXT
             );
+            CREATE TABLE IF NOT EXISTS orchestration_runs (
+                run_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                objective TEXT NOT NULL,
+                plan_version INTEGER NOT NULL,
+                base_commit TEXT NOT NULL,
+                default_provider_id TEXT NOT NULL,
+                default_model_id TEXT,
+                max_parallelism INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                approved_at TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                metadata TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS orchestration_nodes (
+                node_id TEXT NOT NULL,
+                run_id TEXT NOT NULL REFERENCES orchestration_runs(run_id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                instructions TEXT NOT NULL,
+                dependencies TEXT NOT NULL DEFAULT '[]',
+                provider_id TEXT,
+                model_id TEXT,
+                capability_hint TEXT,
+                status TEXT NOT NULL,
+                agent_task_id TEXT,
+                result TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                blocked_reason TEXT,
+                PRIMARY KEY (run_id, node_id)
+            );
+            CREATE INDEX IF NOT EXISTS orchestration_runs_by_project
+                ON orchestration_runs(project_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS orchestration_nodes_by_run
+                ON orchestration_nodes(run_id, node_id);
             """
         )
+        self._ensure_column("agent_tasks", "base_commit", "TEXT")
         self._connection.commit()
 
     def close(self) -> None:
@@ -328,8 +374,8 @@ class ProjectRegistry:
             INSERT INTO agent_tasks(
                 id, project_id, title, task_prompt, provider_id, model_id,
                 reasoning_effort, thread_id, worktree_path, branch_name, status,
-                created_at, updated_at, completion_metadata, active_turn_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at, updated_at, completion_metadata, active_turn_id, base_commit
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 project_id = excluded.project_id,
                 title = excluded.title,
@@ -344,7 +390,8 @@ class ProjectRegistry:
                 created_at = excluded.created_at,
                 updated_at = excluded.updated_at,
                 completion_metadata = excluded.completion_metadata,
-                active_turn_id = excluded.active_turn_id
+                active_turn_id = excluded.active_turn_id,
+                base_commit = excluded.base_commit
             """,
             (
                 task.id,
@@ -362,9 +409,108 @@ class ProjectRegistry:
                 task.updated_at,
                 json.dumps(task.completion_metadata, ensure_ascii=False, sort_keys=True),
                 task.active_turn_id,
+                task.base_commit,
             ),
         )
         self._connection.commit()
+
+    def upsert_orchestration(self, run: OrchestrationRun, nodes: Iterable[OrchestrationNode]) -> None:
+        """Persist one Run and its complete Plan atomically."""
+
+        if self.get_project(run.project_id) is None:
+            raise KeyError(f"Unknown Project: {run.project_id}")
+        normalized = list(nodes)
+        if any(node.run_id != run.run_id for node in normalized):
+            raise ValueError("Orchestration Node belongs to a different Run")
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO orchestration_runs(
+                    run_id, project_id, objective, plan_version, base_commit,
+                    default_provider_id, default_model_id, max_parallelism,
+                    status, created_at, approved_at, started_at, completed_at, metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    project_id = excluded.project_id,
+                    objective = excluded.objective,
+                    plan_version = excluded.plan_version,
+                    base_commit = excluded.base_commit,
+                    default_provider_id = excluded.default_provider_id,
+                    default_model_id = excluded.default_model_id,
+                    max_parallelism = excluded.max_parallelism,
+                    status = excluded.status,
+                    created_at = excluded.created_at,
+                    approved_at = excluded.approved_at,
+                    started_at = excluded.started_at,
+                    completed_at = excluded.completed_at,
+                    metadata = excluded.metadata
+                """,
+                (
+                    run.run_id,
+                    run.project_id,
+                    run.objective,
+                    run.plan_version,
+                    run.base_commit,
+                    run.default_provider_id,
+                    run.default_model_id,
+                    run.max_parallelism,
+                    run.status.value,
+                    run.created_at,
+                    run.approved_at,
+                    run.started_at,
+                    run.completed_at,
+                    json.dumps(run.metadata, ensure_ascii=False, sort_keys=True),
+                ),
+            )
+            self._connection.execute("DELETE FROM orchestration_nodes WHERE run_id = ?", (run.run_id,))
+            self._connection.executemany(
+                """
+                INSERT INTO orchestration_nodes(
+                    node_id, run_id, title, instructions, dependencies, provider_id,
+                    model_id, capability_hint, status, agent_task_id, result,
+                    created_at, updated_at, blocked_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        node.node_id,
+                        node.run_id,
+                        node.title,
+                        node.instructions,
+                        json.dumps(list(node.dependencies), ensure_ascii=False),
+                        node.provider_id,
+                        node.model_id,
+                        node.capability_hint,
+                        node.status.value,
+                        node.agent_task_id,
+                        json.dumps(node.result.to_dict(), ensure_ascii=False, sort_keys=True)
+                        if node.result is not None
+                        else None,
+                        node.created_at,
+                        node.updated_at,
+                        node.blocked_reason,
+                    )
+                    for node in normalized
+                ],
+            )
+
+    def get_orchestration(self, run_id: str) -> tuple[OrchestrationRun | None, list[OrchestrationNode]]:
+        row = self._connection.execute(
+            "SELECT * FROM orchestration_runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            return None, []
+        nodes = self._connection.execute(
+            "SELECT * FROM orchestration_nodes WHERE run_id = ? ORDER BY node_id", (run_id,)
+        ).fetchall()
+        return self._orchestration_run_from_row(row), [self._orchestration_node_from_row(item) for item in nodes]
+
+    def list_orchestrations(self, project_id: str) -> list[OrchestrationRun]:
+        rows = self._connection.execute(
+            "SELECT * FROM orchestration_runs WHERE project_id = ? ORDER BY created_at DESC, run_id",
+            (project_id,),
+        ).fetchall()
+        return [self._orchestration_run_from_row(row) for row in rows]
 
     def remove_agent_task(self, task_id: str) -> None:
         self._connection.execute("DELETE FROM agent_tasks WHERE id = ?", (task_id,))
@@ -413,7 +559,75 @@ class ProjectRegistry:
             updated_at=row["updated_at"],
             completion_metadata=metadata,
             active_turn_id=row["active_turn_id"],
+            base_commit=row["base_commit"],
         )
+
+    @staticmethod
+    def _orchestration_run_from_row(row: sqlite3.Row) -> OrchestrationRun:
+        try:
+            status = OrchestrationRunStatus(row["status"])
+        except ValueError:
+            status = OrchestrationRunStatus.RECOVERY_REQUIRED
+        try:
+            metadata = json.loads(row["metadata"] or "{}")
+        except (TypeError, ValueError):
+            metadata = {"recovery_error": "Run metadata was not valid JSON"}
+        if not isinstance(metadata, dict):
+            metadata = {"recovery_error": "Run metadata was not an object"}
+        return OrchestrationRun(
+            run_id=row["run_id"],
+            project_id=row["project_id"],
+            objective=row["objective"],
+            base_commit=row["base_commit"],
+            default_provider_id=row["default_provider_id"],
+            default_model_id=row["default_model_id"],
+            max_parallelism=row["max_parallelism"],
+            plan_version=row["plan_version"],
+            status=status,
+            created_at=row["created_at"],
+            approved_at=row["approved_at"],
+            started_at=row["started_at"],
+            completed_at=row["completed_at"],
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def _orchestration_node_from_row(row: sqlite3.Row) -> OrchestrationNode:
+        try:
+            status = OrchestrationNodeStatus(row["status"])
+        except ValueError:
+            status = OrchestrationNodeStatus.BLOCKED
+        try:
+            dependencies = json.loads(row["dependencies"] or "[]")
+        except (TypeError, ValueError):
+            dependencies = []
+        if not isinstance(dependencies, list):
+            dependencies = []
+        try:
+            result_payload = json.loads(row["result"]) if row["result"] else None
+        except (TypeError, ValueError):
+            result_payload = None
+        return OrchestrationNode(
+            node_id=row["node_id"],
+            run_id=row["run_id"],
+            title=row["title"],
+            instructions=row["instructions"],
+            dependencies=tuple(value for value in dependencies if isinstance(value, str)),
+            provider_id=row["provider_id"],
+            model_id=row["model_id"],
+            capability_hint=row["capability_hint"],
+            status=status,
+            agent_task_id=row["agent_task_id"],
+            result=ResultEnvelope.from_dict(result_payload),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            blocked_reason=row["blocked_reason"],
+        )
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        columns = {row["name"] for row in self._connection.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            self._connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def _now() -> str:

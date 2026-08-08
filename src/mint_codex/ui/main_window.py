@@ -29,8 +29,10 @@ from PySide6.QtWidgets import (
 
 from mint_codex.core.provider_router import ProviderRouter
 from mint_codex.models.agent_task import AgentTask, AgentTaskStatus
+from mint_codex.models.orchestration import OrchestrationRun
 from mint_codex.models.session import Thread, ThreadSummary
 from mint_codex.ui.developer_workspace import DeveloperWorkspacePanel
+from mint_codex.ui.orchestration import OrchestrationDialog
 from mint_codex.ui.timeline import TimelineWidget
 from mint_codex.workspace.controller import WorkspaceController
 from mint_codex.workspace.registry import Project
@@ -197,6 +199,7 @@ class MainWindow(QMainWindow):
         self.settings = settings or QSettings("MintCodex", "Desktop")
         self._current_thread_key: tuple[str, str] | None = None
         self._current_task_id: str | None = None
+        self._current_run_id: str | None = None
         self._composer_project_id: str | None = None
         expanded = self.settings.value("workspace/expandedProjects", [])
         if isinstance(expanded, str):
@@ -250,6 +253,9 @@ class MainWindow(QMainWindow):
         self.new_agent_task_button = QPushButton("+ New Agent Task")
         self.new_agent_task_button.setObjectName("new_agent_task")
         sidebar_layout.addWidget(self.new_agent_task_button)
+        self.new_orchestration_button = QPushButton("+ New Orchestration")
+        self.new_orchestration_button.setObjectName("new_orchestration")
+        sidebar_layout.addWidget(self.new_orchestration_button)
         self.project_tree = QTreeWidget()
         self.project_tree.setObjectName("project_tree")
         self.project_tree.setHeaderHidden(True)
@@ -334,6 +340,7 @@ class MainWindow(QMainWindow):
         self.project_tree.itemCollapsed.connect(self._project_collapsed)
         self.add_project_button.clicked.connect(self._add_project)
         self.new_agent_task_button.clicked.connect(self._new_agent_task)
+        self.new_orchestration_button.clicked.connect(self._new_orchestration)
         self.remove_project_button.clicked.connect(self._remove_project)
         self.pin_project_button.clicked.connect(self._pin_project)
         self.refresh_projects_button.clicked.connect(self.controller.refresh_projects)
@@ -360,6 +367,7 @@ class MainWindow(QMainWindow):
         self.controller.agent_task_selected.connect(self._set_agent_task)
         self.controller.agent_task_timeline_event.connect(self._agent_task_timeline_event)
         self.controller.workspace_context_changed.connect(self._workspace_context_changed)
+        self.controller.orchestration_runs_changed.connect(self._set_orchestration_runs)
         self.controller.timeline_event.connect(self.timeline.apply_event)
         self.controller.timeline_event.connect(self.developer_workspace.handle_timeline_event)
         self.timeline.file_change_requested.connect(self.developer_workspace.open_changed_file)
@@ -485,6 +493,21 @@ class MainWindow(QMainWindow):
                         if task.id == self._current_task_id:
                             target_item = child
 
+                project_runs = self.controller.orchestration_runs_for_project(project.id)
+                if project_runs:
+                    runs_group = QTreeWidgetItem(project_item)
+                    runs_group.setData(0, TREE_ITEM_KIND_ROLE, "orchestration_runs_group")
+                    runs_group.setText(0, "Orchestration Runs")
+                    runs_group.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                    for run in project_runs:
+                        child = QTreeWidgetItem(runs_group)
+                        child.setData(0, Qt.ItemDataRole.UserRole, run)
+                        child.setData(0, TREE_ITEM_KIND_ROLE, "orchestration_run")
+                        child.setText(0, f"{run.status.value} · {run.objective[:60]}")
+                        child.setToolTip(0, f"Run {run.run_id}\nbase {run.base_commit}")
+                        if run.run_id == self._current_run_id:
+                            target_item = child
+
                 if draft_project_id == project.id:
                     draft = QTreeWidgetItem(project_item)
                     draft.setData(0, TREE_ITEM_KIND_ROLE, "draft")
@@ -533,6 +556,7 @@ class MainWindow(QMainWindow):
         if self.controller.active_agent_task is not None:
             return
         self._current_task_id = None
+        self._current_run_id = None
         self.timeline.clear()
         if isinstance(thread, Thread):
             self._current_thread_key = (thread.provider, thread.id)
@@ -547,6 +571,9 @@ class MainWindow(QMainWindow):
         self._render_workspace_tree()
         self._update_agent_task_actions()
 
+    def _set_orchestration_runs(self, _runs: object) -> None:
+        self._render_workspace_tree()
+
     def _agent_task_updated(self, task: object) -> None:
         if not isinstance(task, AgentTask):
             return
@@ -559,6 +586,7 @@ class MainWindow(QMainWindow):
         if not isinstance(task, AgentTask):
             return
         self._current_task_id = task.id
+        self._current_run_id = None
         self._current_thread_key = None
         self.timeline.clear()
         self.thread_name.setText(f"{task.title} · {task.status_label}")
@@ -633,6 +661,15 @@ class MainWindow(QMainWindow):
             project_id = parent.data(0, Qt.ItemDataRole.UserRole) if parent else None
             if isinstance(project_id, str):
                 self.controller.activate_project(project_id, source="agent-task-group")
+        elif kind == "orchestration_run":
+            run = current.data(0, Qt.ItemDataRole.UserRole)
+            if isinstance(run, OrchestrationRun):
+                self._open_orchestration(run.run_id)
+        elif kind == "orchestration_runs_group":
+            parent = current.parent()
+            project_id = parent.data(0, Qt.ItemDataRole.UserRole) if parent else None
+            if isinstance(project_id, str):
+                self.controller.activate_project(project_id, source="orchestration-group")
         elif kind == "thread":
             summary = current.data(0, Qt.ItemDataRole.UserRole)
             if isinstance(summary, ThreadSummary):
@@ -675,6 +712,21 @@ class MainWindow(QMainWindow):
         )
         if task is not None:
             self.statusBar().showMessage(f"Created Agent Task: {task.title}", 5000)
+
+    def _new_orchestration(self) -> None:
+        if self.controller.current_project is None:
+            self._error("Add or open a Project before creating an Orchestration Run")
+            return
+        dialog = OrchestrationDialog(self.controller, self)
+        self._orchestration_dialog = dialog
+        dialog.exec()
+        self._orchestration_dialog = None
+
+    def _open_orchestration(self, run_id: str) -> None:
+        dialog = OrchestrationDialog(self.controller, self, run_id=run_id)
+        self._orchestration_dialog = dialog
+        dialog.exec()
+        self._orchestration_dialog = None
 
     def _cancel_agent_task(self) -> None:
         task = self.controller.active_agent_task

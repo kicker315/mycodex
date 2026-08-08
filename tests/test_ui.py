@@ -3,6 +3,7 @@ import subprocess
 
 from mint_codex.ui.developer_workspace import DeveloperWorkspacePanel
 from mint_codex.ui.main_window import MainWindow, SettingsDialog
+from mint_codex.ui.orchestration import OrchestrationDialog
 from mint_codex.workspace.controller import WorkspaceController
 from mint_codex.workspace.registry import ProjectRegistry
 
@@ -51,6 +52,7 @@ def test_main_window_has_collapsible_developer_workspace_and_three_contexts(qapp
 
     assert window.developer_workspace.objectName() == "developer_workspace"
     assert window.developer_workspace.tabs.count() == 3
+    assert window.new_orchestration_button.objectName() == "new_orchestration"
     assert len(window.centralWidget().sizes()) == 3
     window.developer_workspace_toggle.click()
     assert window.developer_workspace.isHidden() is True
@@ -134,3 +136,28 @@ def test_developer_workspace_layout_state_restores(qapp, tmp_path):
     assert saved_width > 0
     assert second.centralWidget().sizes()[2] == saved_width
     second.close()
+
+
+def test_orchestration_dialog_creates_and_validates_a_plan(qapp, tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    subprocess.run(["git", "-C", str(project), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(project), "config", "user.name", "Test"], check=True)
+    source = project / "source.py"
+    source.write_text("before\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(project), "add", "source.py"], check=True)
+    subprocess.run(["git", "-C", str(project), "commit", "-qm", "initial"], check=True)
+    workspace = make_workspace(tmp_path)
+    workspace.add_project(project, name="project")
+    dialog = OrchestrationDialog(workspace)
+    dialog.objective_input.setPlainText("Inspect the project")
+    dialog.create_run.click()
+    assert dialog.run_id is not None
+    dialog.plan_editor.setPlainText(
+        '{"nodes":[{"node_id":"a","title":"Inspect","instructions":"Read files","dependencies":[]}]}'
+    )
+    dialog.validate_plan.click()
+    assert workspace.orchestration_run(dialog.run_id).status.value == "validated"
+    dialog.close()
+    workspace.registry.close()

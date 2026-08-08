@@ -67,6 +67,7 @@ class AgentTask:
     updated_at: str = field(default_factory=lambda: _now())
     completion_metadata: dict[str, Any] = field(default_factory=dict)
     active_turn_id: str | None = None
+    base_commit: str | None = None
 
     @property
     def is_running(self) -> bool:

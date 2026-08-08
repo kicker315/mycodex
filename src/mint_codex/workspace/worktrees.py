@@ -56,6 +56,20 @@ class WorktreeManager:
             raise WorktreeError("Project must be the Git repository root for Agent Tasks")
         return repository_root
 
+    def resolve_commit(self, project_root: Path, ref: str = "HEAD") -> str:
+        """Resolve a safe Git revision to an immutable commit id."""
+
+        root = self.validate_repository(project_root)
+        if not isinstance(ref, str) or not ref.strip() or "\x00" in ref:
+            raise WorktreeError("Invalid Git base commit")
+        result = self._git(root, ["rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"])
+        if result.returncode != 0:
+            raise WorktreeError("Git base commit could not be resolved")
+        commit = result.stdout.strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", commit):
+            raise WorktreeError("Git base commit was not a full commit id")
+        return commit.lower()
+
     def task_path(self, project_id: str, task_id: str) -> Path:
         self._validate_segment(project_id, "project id")
         self._validate_segment(task_id, "task id")
@@ -71,14 +85,21 @@ class WorktreeManager:
             raise WorktreeError("Generated Agent Task branch is not a valid Git ref")
         return branch
 
-    def create(self, project_root: Path, project_id: str, task_id: str) -> tuple[Path, str]:
+    def create(
+        self,
+        project_root: Path,
+        project_id: str,
+        task_id: str,
+        base_ref: str = "HEAD",
+    ) -> tuple[Path, str]:
         root = self.validate_repository(project_root)
+        base_commit = self.resolve_commit(root, base_ref)
         path = self.task_path(project_id, task_id)
         branch = self.branch_name(project_id, task_id)
         if path.exists():
             raise WorktreeError(f"Agent Task worktree already exists: {path}")
         path.parent.mkdir(parents=True, exist_ok=True)
-        result = self._git(root, ["worktree", "add", "-b", branch, str(path), "HEAD"])
+        result = self._git(root, ["worktree", "add", "-b", branch, str(path), base_commit])
         if result.returncode != 0:
             self._remove_empty_directory(path)
             message = result.stderr.strip() or "git worktree add failed"
