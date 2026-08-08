@@ -30,10 +30,12 @@ class ApprovalRequest:
     cwd: str | None = None
     reason: str | None = None
     raw_params: dict[str, Any] = field(default_factory=dict, repr=False)
+    task_id: str | None = None
 
     @property
     def request_key(self) -> str:
-        return f"{self.provider_id}:{self.request_id}"
+        prefix = f"task:{self.task_id}:" if self.task_id else ""
+        return f"{prefix}{self.provider_id}:{self.request_id}"
 
     @property
     def is_legacy(self) -> bool:
@@ -112,6 +114,7 @@ class TimelineItem:
                 "request_key": request.request_key,
                 "method": request.method,
                 "provider": request.provider_id,
+                "task_id": request.task_id,
                 "thread_id": request.thread_id,
                 "turn_id": request.turn_id,
                 "item_id": request.item_id,

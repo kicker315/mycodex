@@ -24,7 +24,7 @@ Thread history records its provider and model. Resume always routes through the 
 
 ## Project workspace
 
-The desktop workspace is organized as `Project → Provider → Thread → Turn → Item`. Project metadata and lightweight Thread indexes are stored in a local SQLite registry at `~/.local/share/mint-codex/workspace.sqlite3`; Codex conversation bodies remain owned by the App Server and are not copied into that registry.
+The desktop workspace is organized as `Project → Provider → Thread → Turn → Item`. Project metadata, lightweight Thread indexes, and Agent Task metadata are stored in a local SQLite registry at `~/.local/share/mint-codex/workspace.sqlite3`; Codex conversation bodies remain owned by the App Server and are not copied into that registry.
 
 The main window restores the last Project and Thread context, uses the Project's absolute path for `thread/start.cwd` and `thread/list.cwd`, and presents a Project tree with each project's indexed Threads and an inline New Thread button. Provider credentials are available from Settings, not the main workspace. Timeline events are converted into domain items before Qt rendering so user messages, agent messages, commands, file changes, tool calls, status, and errors remain distinct.
 
@@ -39,3 +39,9 @@ Run the test suite with:
 ```bash
 pytest -q
 ```
+
+## MVP-5A parallel Agent Tasks
+
+`+ New Agent Task` creates a client-owned Agent Task with its own branch and Git worktree under `~/.local/share/mint-codex/worktrees/<project-id>/<task-id>/`. The task prompt starts one Thread with `cwd` fixed to that worktree. Provider-level App Server processes are reused; notifications and approvals are routed by `(provider, thread_id)` and then by task id.
+
+The active workspace context is either the Project's Main Workspace or one Agent Task worktree. Git status, diff, file preview, terminal, timeline, and new turns derive their root from that context. Agent Task completion never merges, commits, pushes, or removes a worktree. Cleanup is explicit and refuses dirty worktrees, active turns, or active terminals.

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QCoreApplication, QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -33,8 +33,9 @@ class DeveloperWorkspacePanel(QWidget):
         self.setObjectName("developer_workspace")
         self._project_id: str | None = None
         self._root: Path | None = None
+        self._context_key: str | None = None
         self._changes: dict[str, GitChange] = {}
-        self._terminal: TerminalSession | None = None
+        self._terminals: dict[str, TerminalSession] = {}
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.setInterval(250)
@@ -159,15 +160,24 @@ class DeveloperWorkspacePanel(QWidget):
 
     @property
     def terminal(self) -> TerminalSession | None:
-        return self._terminal
+        return self._terminals.get(self._context_key or "")
 
-    def set_project(self, project_id: str | None, root: Path | None) -> None:
+    @property
+    def terminal_active(self) -> bool:
+        terminal = self.terminal
+        return terminal is not None and terminal.is_running
+
+    def any_terminal_active(self) -> bool:
+        return any(terminal.is_running for terminal in self._terminals.values())
+
+    def set_project(self, project_id: str | None, root: Path | None, context_key: str | None = None) -> None:
         resolved = root.expanduser().resolve(strict=False) if root is not None else None
-        if project_id == self._project_id and resolved == self._root:
+        key = context_key or (f"main:{project_id}" if project_id else "none")
+        if project_id == self._project_id and resolved == self._root and key == self._context_key:
             return
-        self._stop_terminal()
         self._project_id = project_id
         self._root = resolved
+        self._context_key = key
         self._changes.clear()
         self.changed_files.clear()
         self.diff_path.setText("Select a changed file")
@@ -259,26 +269,31 @@ class DeveloperWorkspacePanel(QWidget):
     def start_terminal(self) -> None:
         if self._root is None:
             return
-        if self._terminal is None:
-            self._terminal = TerminalSession(self._root, self)
-            self._terminal.output.connect(self.terminal_output.insertPlainText)
-            self._terminal.state_changed.connect(self._terminal_state_changed)
-            self._terminal.error.connect(self._terminal_error)
-            self._terminal.finished.connect(lambda _code: self._terminal_state_changed("Exited"))
-        if self._terminal.start():
+        key = self._context_key or "none"
+        terminal = self._terminals.get(key)
+        if terminal is None:
+            terminal = TerminalSession(self._root, self)
+            self._terminals[key] = terminal
+            terminal.output.connect(lambda text, terminal_key=key: self._terminal_output(terminal_key, text))
+            terminal.state_changed.connect(lambda state, terminal_key=key: self._terminal_state(terminal_key, state))
+            terminal.error.connect(lambda message, terminal_key=key: self._terminal_error_for(terminal_key, message))
+            terminal.finished.connect(lambda _code, terminal_key=key: self._terminal_state(terminal_key, "Exited"))
+        if terminal.start():
             self.terminal_output.appendPlainText(f"\n[terminal cwd: {self._root}]\n")
 
     def send_terminal_input(self) -> None:
-        if self._terminal is None or not self._terminal.is_running:
+        terminal = self.terminal
+        if terminal is None or not terminal.is_running:
             return
         text = self.terminal_input.toPlainText()
         if text:
-            self._terminal.send_input(text + ("" if text.endswith("\n") else "\n"))
+            terminal.send_input(text + ("" if text.endswith("\n") else "\n"))
             self.terminal_input.clear()
 
     def interrupt_terminal(self) -> None:
-        if self._terminal is not None:
-            self._terminal.interrupt()
+        terminal = self.terminal
+        if terminal is not None:
+            terminal.interrupt()
 
     def _terminal_state_changed(self, state: str) -> None:
         running = state in {"Running", "Starting"}
@@ -290,18 +305,36 @@ class DeveloperWorkspacePanel(QWidget):
     def _terminal_error(self, message: str) -> None:
         self.terminal_output.appendPlainText(f"\n[terminal error: {message}]\n")
 
+    def _terminal_output(self, key: str, text: str) -> None:
+        if key == self._context_key:
+            self.terminal_output.insertPlainText(text)
+
+    def _terminal_state(self, key: str, state: str) -> None:
+        if key == self._context_key:
+            self._terminal_state_changed(state)
+
+    def _terminal_error_for(self, key: str, message: str) -> None:
+        if key == self._context_key:
+            self._terminal_error(message)
+
     def _stop_terminal(self) -> None:
-        if self._terminal is not None:
-            self._terminal.stop()
-            self._terminal.deleteLater()
-            self._terminal = None
+        terminal = self.terminal
+        if terminal is not None:
+            terminal.stop()
+            self._terminals.pop(self._context_key or "", None)
+            terminal.deleteLater()
+            QCoreApplication.sendPostedEvents(terminal, QEvent.Type.DeferredDelete)
         self.terminal_output.clear()
         self.terminal_start.setEnabled(True)
         self.terminal_interrupt.setEnabled(False)
 
     def shutdown(self) -> None:
         self._refresh_timer.stop()
-        self._stop_terminal()
+        for terminal in list(self._terminals.values()):
+            terminal.stop()
+            terminal.deleteLater()
+            QCoreApplication.sendPostedEvents(terminal, QEvent.Type.DeferredDelete)
+        self._terminals.clear()
         self.git.close()
 
     def _find_change(self, path: str) -> GitChange | None:

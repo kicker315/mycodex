@@ -28,11 +28,13 @@ from PySide6.QtWidgets import (
 )
 
 from mint_codex.core.provider_router import ProviderRouter
+from mint_codex.models.agent_task import AgentTask, AgentTaskStatus
 from mint_codex.models.session import Thread, ThreadSummary
 from mint_codex.ui.developer_workspace import DeveloperWorkspacePanel
 from mint_codex.ui.timeline import TimelineWidget
 from mint_codex.workspace.controller import WorkspaceController
 from mint_codex.workspace.registry import Project
+from mint_codex.workspace.state import WorkspaceContextKind
 
 
 TREE_ITEM_KIND_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -139,12 +141,62 @@ class ProjectTreeRow(QWidget):
         super().mousePressEvent(event)
 
 
+class AgentTaskDialog(QDialog):
+    def __init__(self, controller: WorkspaceController, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.controller = controller
+        self.setWindowTitle("New Agent Task")
+        self.resize(560, 390)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.title_input = QLineEdit()
+        self.title_input.setPlaceholderText("Short task title")
+        self.prompt_input = QTextEdit()
+        self.prompt_input.setPlaceholderText("What should this Agent do in its isolated worktree?")
+        self.provider_input = QComboBox()
+        for provider_id in controller.provider_ids:
+            self.provider_input.addItem(controller.providers[provider_id].display_name, provider_id)
+        self.model_input = QLineEdit()
+        selected_model = controller._selected_models.get(controller.selected_provider)
+        self.model_input.setText(selected_model or "")
+        self.reasoning_input = QComboBox()
+        self.reasoning_input.addItem("Reasoning: default", None)
+        for effort in ("low", "medium", "high"):
+            self.reasoning_input.addItem(f"Reasoning: {effort}", effort)
+        form.addRow("Title", self.title_input)
+        form.addRow("Prompt", self.prompt_input)
+        form.addRow("Provider", self.provider_input)
+        form.addRow("Model", self.model_input)
+        form.addRow("Reasoning", self.reasoning_input)
+        layout.addLayout(form)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("Cancel")
+        create = QPushButton("Create Task")
+        create.setDefault(True)
+        buttons.addWidget(cancel)
+        buttons.addWidget(create)
+        layout.addLayout(buttons)
+        cancel.clicked.connect(self.reject)
+        create.clicked.connect(self.accept)
+
+    def values(self) -> tuple[str, str, str, str | None, str | None]:
+        return (
+            self.title_input.text(),
+            self.prompt_input.toPlainText(),
+            str(self.provider_input.currentData()),
+            self.model_input.text().strip() or None,
+            self.reasoning_input.currentData(),
+        )
+
+
 class MainWindow(QMainWindow):
     def __init__(self, controller: WorkspaceController, settings: QSettings | None = None):
         super().__init__()
         self.controller = controller
         self.settings = settings or QSettings("MintCodex", "Desktop")
         self._current_thread_key: tuple[str, str] | None = None
+        self._current_task_id: str | None = None
         self._composer_project_id: str | None = None
         expanded = self.settings.value("workspace/expandedProjects", [])
         if isinstance(expanded, str):
@@ -158,7 +210,10 @@ class MainWindow(QMainWindow):
         self._restore_ui_state()
         self._set_projects(controller.projects)
         self._set_current_project(controller.current_project)
-        self._set_thread(controller.current_thread)
+        if controller.active_agent_task is not None:
+            self._set_agent_task(controller.active_agent_task, controller.current_thread)
+        else:
+            self._set_thread(controller.current_thread)
         self._set_provider(controller.selected_provider)
         self._set_history_loading(controller.history_loading)
 
@@ -192,6 +247,9 @@ class MainWindow(QMainWindow):
         projects_header.addWidget(self.refresh_projects_button)
         projects_header.addWidget(self.refresh_threads_button)
         sidebar_layout.addLayout(projects_header)
+        self.new_agent_task_button = QPushButton("+ New Agent Task")
+        self.new_agent_task_button.setObjectName("new_agent_task")
+        sidebar_layout.addWidget(self.new_agent_task_button)
         self.project_tree = QTreeWidget()
         self.project_tree.setObjectName("project_tree")
         self.project_tree.setHeaderHidden(True)
@@ -224,6 +282,10 @@ class MainWindow(QMainWindow):
         self.thread_name = QLabel("New Thread")
         self.new_thread_toolbar = QPushButton("New Thread")
         self.settings_button = QPushButton("Settings")
+        self.cancel_agent_task_button = QPushButton("Cancel Task")
+        self.cleanup_agent_task_button = QPushButton("Cleanup Task")
+        self.cancel_agent_task_button.setVisible(False)
+        self.cleanup_agent_task_button.setVisible(False)
         self.developer_workspace_toggle = QToolButton()
         self.developer_workspace_toggle.setText("Workspace")
         self.developer_workspace_toggle.setCheckable(True)
@@ -237,6 +299,8 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.agent_status)
         toolbar.addWidget(self.thread_name, 1)
         toolbar.addWidget(self.new_thread_toolbar)
+        toolbar.addWidget(self.cancel_agent_task_button)
+        toolbar.addWidget(self.cleanup_agent_task_button)
         toolbar.addWidget(self.settings_button)
         toolbar.addWidget(self.developer_workspace_toggle)
         content_layout.addLayout(toolbar)
@@ -269,6 +333,7 @@ class MainWindow(QMainWindow):
         self.project_tree.itemExpanded.connect(self._project_expanded)
         self.project_tree.itemCollapsed.connect(self._project_collapsed)
         self.add_project_button.clicked.connect(self._add_project)
+        self.new_agent_task_button.clicked.connect(self._new_agent_task)
         self.remove_project_button.clicked.connect(self._remove_project)
         self.pin_project_button.clicked.connect(self._pin_project)
         self.refresh_projects_button.clicked.connect(self.controller.refresh_projects)
@@ -290,6 +355,11 @@ class MainWindow(QMainWindow):
         self.controller.models_changed.connect(self._set_models)
         self.controller.provider_changed.connect(self._set_provider)
         self.controller.thread_changed.connect(self._set_thread)
+        self.controller.agent_tasks_changed.connect(self._set_agent_tasks)
+        self.controller.agent_task_changed.connect(self._agent_task_updated)
+        self.controller.agent_task_selected.connect(self._set_agent_task)
+        self.controller.agent_task_timeline_event.connect(self._agent_task_timeline_event)
+        self.controller.workspace_context_changed.connect(self._workspace_context_changed)
         self.controller.timeline_event.connect(self.timeline.apply_event)
         self.controller.timeline_event.connect(self.developer_workspace.handle_timeline_event)
         self.timeline.file_change_requested.connect(self.developer_workspace.open_changed_file)
@@ -298,6 +368,8 @@ class MainWindow(QMainWindow):
         self.timeline.approval_decision.connect(self.controller.respond_to_approval)
         self.controller.busy_changed.connect(self._set_busy)
         self.controller.error.connect(self._error)
+        self.cancel_agent_task_button.clicked.connect(self._cancel_agent_task)
+        self.cleanup_agent_task_button.clicked.connect(self._cleanup_agent_task)
 
     def _restore_ui_state(self) -> None:
         geometry = self.settings.value("window/geometry")
@@ -349,11 +421,15 @@ class MainWindow(QMainWindow):
         if project is not None:
             self.project_name.setText(project.name)
             self.project_name.setToolTip(str(project.path))
-            self.developer_workspace.set_project(project.id, project.path)
+            root = self.controller.active_workspace_root
+            context = self.controller.active_workspace_context
+            context_key = context.key if context is not None else f"main:{project.id}"
+            self.developer_workspace.set_project(project.id, root or project.path, context_key)
         else:
             self.project_name.setText("No Project")
             self.project_name.setToolTip("")
             self.developer_workspace.set_project(None, None)
+        self._update_agent_task_actions()
         self._update_project_actions()
 
     def _render_workspace_tree(self) -> None:
@@ -394,6 +470,21 @@ class MainWindow(QMainWindow):
                     if current_key == (summary.provider, summary.id):
                         target_item = child
 
+                project_tasks = self.controller.agent_tasks_for_project(project.id)
+                if project_tasks:
+                    tasks_group = QTreeWidgetItem(project_item)
+                    tasks_group.setData(0, TREE_ITEM_KIND_ROLE, "agent_tasks_group")
+                    tasks_group.setText(0, "Agent Tasks")
+                    tasks_group.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                    for task in project_tasks:
+                        child = QTreeWidgetItem(tasks_group)
+                        child.setData(0, Qt.ItemDataRole.UserRole, task)
+                        child.setData(0, TREE_ITEM_KIND_ROLE, "agent_task")
+                        child.setText(0, self._agent_task_label(task))
+                        child.setToolTip(0, f"{task.worktree_path}\n{task.branch_name}")
+                        if task.id == self._current_task_id:
+                            target_item = child
+
                 if draft_project_id == project.id:
                     draft = QTreeWidgetItem(project_item)
                     draft.setData(0, TREE_ITEM_KIND_ROLE, "draft")
@@ -417,6 +508,11 @@ class MainWindow(QMainWindow):
         model = summary.model or "unknown model"
         return f"{title}\n{summary.provider} · {model} · {_activity(summary.updated_at)}"
 
+    @staticmethod
+    def _agent_task_label(task: AgentTask) -> str:
+        model = task.model_id or "default model"
+        return f"{task.status_icon} {task.title}\n{task.provider_id} · {model} · {task.status_label}"
+
     def _project_expanded(self, item: QTreeWidgetItem) -> None:
         project_id = item.data(0, Qt.ItemDataRole.UserRole)
         if isinstance(project_id, str):
@@ -434,6 +530,9 @@ class MainWindow(QMainWindow):
         self._sync_workspace_state()
 
     def _set_thread(self, thread: object) -> None:
+        if self.controller.active_agent_task is not None:
+            return
+        self._current_task_id = None
         self.timeline.clear()
         if isinstance(thread, Thread):
             self._current_thread_key = (thread.provider, thread.id)
@@ -443,6 +542,53 @@ class MainWindow(QMainWindow):
             self._current_thread_key = None
             self.thread_name.setText("New Thread")
         self._set_threads(self.controller.workspace_threads)
+
+    def _set_agent_tasks(self, _tasks: object) -> None:
+        self._render_workspace_tree()
+        self._update_agent_task_actions()
+
+    def _agent_task_updated(self, task: object) -> None:
+        if not isinstance(task, AgentTask):
+            return
+        if task.id == self._current_task_id:
+            self.thread_name.setText(f"{task.title} · {task.status_label}")
+            self._set_agent_status(task.status_label)
+        self._set_agent_tasks(self.controller.agent_tasks)
+
+    def _set_agent_task(self, task: object, thread: object) -> None:
+        if not isinstance(task, AgentTask):
+            return
+        self._current_task_id = task.id
+        self._current_thread_key = None
+        self.timeline.clear()
+        self.thread_name.setText(f"{task.title} · {task.status_label}")
+        self._set_agent_status(task.status_label)
+        if isinstance(thread, Thread):
+            self.timeline.load_thread(thread)
+        for request in self.controller._pending_task_approvals(task.id):
+            self.timeline.add_approval_request(request)
+        self._sync_workspace_state()
+        self._set_provider(task.provider_id)
+        model_index = self.models.findData(task.model_id)
+        if model_index >= 0:
+            self.models.setCurrentIndex(model_index)
+        self._update_agent_task_actions()
+
+    def _agent_task_timeline_event(self, task_id: str, kind: str, data: object) -> None:
+        if task_id != self._current_task_id:
+            return
+        self.timeline.apply_event(kind, data)
+        self.developer_workspace.handle_timeline_event(kind, data)
+
+    def _workspace_context_changed(self, _context: object) -> None:
+        self._sync_workspace_state()
+
+    def _update_agent_task_actions(self) -> None:
+        task = self.controller.active_agent_task
+        has_task = task is not None
+        self.cancel_agent_task_button.setVisible(has_task and task.status in {AgentTaskStatus.CREATING, AgentTaskStatus.READY, AgentTaskStatus.RUNNING, AgentTaskStatus.WAITING_APPROVAL})
+        self.cleanup_agent_task_button.setVisible(has_task and task.status in {AgentTaskStatus.COMPLETED, AgentTaskStatus.CANCELLED, AgentTaskStatus.FAILED, AgentTaskStatus.ORPHANED})
+        self.new_agent_task_button.setEnabled(self.controller.current_project is not None)
 
     def _set_models(self, models: object, default: object) -> None:
         self.models.blockSignals(True)
@@ -478,6 +624,15 @@ class MainWindow(QMainWindow):
             project_id = current.data(0, Qt.ItemDataRole.UserRole)
             if isinstance(project_id, str):
                 self.controller.activate_project(project_id, source="project-tree")
+        elif kind == "agent_task":
+            task = current.data(0, Qt.ItemDataRole.UserRole)
+            if isinstance(task, AgentTask):
+                self.controller.activate_agent_task(task.id, source="agent-task-tree")
+        elif kind == "agent_tasks_group":
+            parent = current.parent()
+            project_id = parent.data(0, Qt.ItemDataRole.UserRole) if parent else None
+            if isinstance(project_id, str):
+                self.controller.activate_project(project_id, source="agent-task-group")
         elif kind == "thread":
             summary = current.data(0, Qt.ItemDataRole.UserRole)
             if isinstance(summary, ThreadSummary):
@@ -502,6 +657,41 @@ class MainWindow(QMainWindow):
     def _new_thread(self) -> None:
         if self.controller.new_thread():
             self._prepare_new_thread_ui()
+
+    def _new_agent_task(self) -> None:
+        if self.controller.current_project is None:
+            self._error("Add or open a Project before creating an Agent Task")
+            return
+        dialog = AgentTaskDialog(self.controller, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        title, prompt, provider, model, effort = dialog.values()
+        task = self.controller.create_agent_task(
+            title,
+            prompt,
+            provider_id=provider,
+            model_id=model,
+            reasoning_effort=effort,
+        )
+        if task is not None:
+            self.statusBar().showMessage(f"Created Agent Task: {task.title}", 5000)
+
+    def _cancel_agent_task(self) -> None:
+        task = self.controller.active_agent_task
+        if task is not None:
+            self.controller.cancel_agent_task(task.id)
+
+    def _cleanup_agent_task(self) -> None:
+        task = self.controller.active_agent_task
+        if task is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Cleanup Agent Task",
+            "Remove this clean Agent Task worktree? Uncommitted changes are never force-deleted.",
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.controller.cleanup_agent_task(task.id, terminal_active=self.developer_workspace.any_terminal_active())
 
     def _prepare_new_thread_ui(self) -> None:
         self.input.clear()
@@ -599,7 +789,9 @@ class MainWindow(QMainWindow):
             self.controller.send_text(text)
 
     def _set_busy(self, busy: bool) -> None:
-        self.send.setEnabled(not busy and self.controller.current_project is not None)
+        task = self.controller.active_agent_task
+        task_busy = task is not None and task.status in {AgentTaskStatus.CREATING, AgentTaskStatus.RUNNING, AgentTaskStatus.WAITING_APPROVAL}
+        self.send.setEnabled(not busy and not task_busy and self.controller.current_project is not None)
         self.statusBar().showMessage("Working…" if busy else "Ready")
 
     def _set_agent_status(self, status: str) -> None:
@@ -623,7 +815,10 @@ class MainWindow(QMainWindow):
         self.remove_project_button.setEnabled(enabled)
         self.pin_project_button.setEnabled(enabled)
         self.new_thread_toolbar.setEnabled(enabled)
-        self.send.setEnabled(enabled and not self.controller.busy)
+        task = self.controller.active_agent_task
+        task_busy = task is not None and task.status in {AgentTaskStatus.CREATING, AgentTaskStatus.RUNNING, AgentTaskStatus.WAITING_APPROVAL}
+        self.send.setEnabled(enabled and not self.controller.busy and not task_busy)
+        self.new_agent_task_button.setEnabled(enabled)
         if project is not None:
             self.pin_project_button.setText("★" if project.pinned else "☆")
 

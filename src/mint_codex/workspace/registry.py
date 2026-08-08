@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
 from mint_codex.models.session import ThreadSummary
+from mint_codex.models.agent_task import AgentTask, AgentTaskStatus
 
 
 @dataclass(frozen=True)
@@ -22,11 +24,12 @@ class Project:
 
 
 class ProjectRegistry:
-    """Persist Project metadata and lightweight Thread indexes only.
+    """Persist Project metadata, lightweight Thread indexes, and Task metadata.
 
     Codex remains the source of truth for Thread, Turn, and Item contents.
     This registry stores enough metadata to group server-owned Threads under a
-    local Project and restore the last workspace selection.
+    local Project, restore workspace selection, and recover isolated Agent
+    Task worktrees without copying conversation bodies.
     """
 
     def __init__(self, database_path: Path | None = None):
@@ -63,6 +66,25 @@ class ProjectRegistry:
             );
             CREATE INDEX IF NOT EXISTS threads_by_project_activity
                 ON threads(project_id, archived, updated_at DESC);
+            CREATE TABLE IF NOT EXISTS agent_tasks (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                task_prompt TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                model_id TEXT,
+                reasoning_effort TEXT,
+                thread_id TEXT,
+                worktree_path TEXT NOT NULL,
+                branch_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completion_metadata TEXT NOT NULL DEFAULT '{}',
+                active_turn_id TEXT
+            );
+            CREATE INDEX IF NOT EXISTS agent_tasks_by_project_activity
+                ON agent_tasks(project_id, status, updated_at DESC);
             CREATE TABLE IF NOT EXISTS workspace_state (
                 key TEXT PRIMARY KEY,
                 value TEXT
@@ -133,6 +155,29 @@ class ProjectRegistry:
                 "INSERT INTO workspace_state(key, value) VALUES ('active_project_id', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (project_id,),
+            )
+        self._connection.commit()
+
+    def get_active_workspace_task_id(self) -> str | None:
+        row = self._connection.execute(
+            "SELECT value FROM workspace_state WHERE key = 'active_workspace_task_id'"
+        ).fetchone()
+        task_id = row["value"] if row else None
+        if not isinstance(task_id, str):
+            return None
+        task = self.get_agent_task(task_id)
+        return task.id if task else None
+
+    def set_active_workspace_task_id(self, task_id: str | None) -> None:
+        if task_id is None:
+            self._connection.execute("DELETE FROM workspace_state WHERE key = 'active_workspace_task_id'")
+        else:
+            if self.get_agent_task(task_id) is None:
+                raise KeyError(f"Unknown Agent Task: {task_id}")
+            self._connection.execute(
+                "INSERT INTO workspace_state(key, value) VALUES ('active_workspace_task_id', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (task_id,),
             )
         self._connection.commit()
 
@@ -261,6 +306,73 @@ class ProjectRegistry:
         )
         self._connection.commit()
 
+    def get_agent_task(self, task_id: str) -> AgentTask | None:
+        row = self._connection.execute("SELECT * FROM agent_tasks WHERE id = ?", (task_id,)).fetchone()
+        return self._agent_task_from_row(row) if row else None
+
+    def list_agent_tasks(self, project_id: str, *, include_archived: bool = False) -> list[AgentTask]:
+        query = "SELECT * FROM agent_tasks WHERE project_id = ?"
+        params: list[object] = [project_id]
+        if not include_archived:
+            query += " AND status != ?"
+            params.append(AgentTaskStatus.ARCHIVED.value)
+        query += " ORDER BY updated_at DESC, id"
+        rows = self._connection.execute(query, params).fetchall()
+        return [self._agent_task_from_row(row) for row in rows]
+
+    def upsert_agent_task(self, task: AgentTask) -> None:
+        if self.get_project(task.project_id) is None:
+            raise KeyError(f"Unknown Project: {task.project_id}")
+        self._connection.execute(
+            """
+            INSERT INTO agent_tasks(
+                id, project_id, title, task_prompt, provider_id, model_id,
+                reasoning_effort, thread_id, worktree_path, branch_name, status,
+                created_at, updated_at, completion_metadata, active_turn_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                project_id = excluded.project_id,
+                title = excluded.title,
+                task_prompt = excluded.task_prompt,
+                provider_id = excluded.provider_id,
+                model_id = excluded.model_id,
+                reasoning_effort = excluded.reasoning_effort,
+                thread_id = excluded.thread_id,
+                worktree_path = excluded.worktree_path,
+                branch_name = excluded.branch_name,
+                status = excluded.status,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at,
+                completion_metadata = excluded.completion_metadata,
+                active_turn_id = excluded.active_turn_id
+            """,
+            (
+                task.id,
+                task.project_id,
+                task.title,
+                task.task_prompt,
+                task.provider_id,
+                task.model_id,
+                task.reasoning_effort,
+                task.thread_id,
+                str(task.worktree_path),
+                task.branch_name,
+                task.status.value,
+                task.created_at,
+                task.updated_at,
+                json.dumps(task.completion_metadata, ensure_ascii=False, sort_keys=True),
+                task.active_turn_id,
+            ),
+        )
+        self._connection.commit()
+
+    def remove_agent_task(self, task_id: str) -> None:
+        self._connection.execute("DELETE FROM agent_tasks WHERE id = ?", (task_id,))
+        self._connection.execute(
+            "DELETE FROM workspace_state WHERE key = 'active_workspace_task_id' AND value = ?", (task_id,)
+        )
+        self._connection.commit()
+
     @staticmethod
     def _project_from_row(row: sqlite3.Row) -> Project:
         return Project(
@@ -271,6 +383,36 @@ class ProjectRegistry:
             pinned=bool(row["pinned"]),
             default_provider=row["default_provider"],
             default_model=row["default_model"],
+        )
+
+    @staticmethod
+    def _agent_task_from_row(row: sqlite3.Row) -> AgentTask:
+        try:
+            status = AgentTaskStatus(row["status"])
+        except ValueError:
+            status = AgentTaskStatus.ORPHANED
+        try:
+            metadata = json.loads(row["completion_metadata"] or "{}")
+        except (TypeError, ValueError):
+            metadata = {"recovery_error": "Task metadata was not valid JSON"}
+        if not isinstance(metadata, dict):
+            metadata = {"recovery_error": "Task metadata was not an object"}
+        return AgentTask(
+            id=row["id"],
+            project_id=row["project_id"],
+            title=row["title"],
+            task_prompt=row["task_prompt"],
+            provider_id=row["provider_id"],
+            model_id=row["model_id"],
+            reasoning_effort=row["reasoning_effort"],
+            thread_id=row["thread_id"],
+            worktree_path=Path(row["worktree_path"]),
+            branch_name=row["branch_name"],
+            status=status,
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            completion_metadata=metadata,
+            active_turn_id=row["active_turn_id"],
         )
 
 

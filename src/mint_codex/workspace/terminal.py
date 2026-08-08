@@ -8,7 +8,7 @@ import termios
 import warnings
 from pathlib import Path
 
-from PySide6.QtCore import QSocketNotifier, QTimer, QObject, Signal
+from PySide6.QtCore import QCoreApplication, QEvent, QSocketNotifier, QTimer, QObject, Signal
 
 
 class TerminalSession(QObject):
@@ -117,7 +117,7 @@ class TerminalSession(QObject):
             os.waitpid(pid, 0)
         except ChildProcessError:
             pass
-        self._finish(-signal.SIGKILL)
+        self._finish(-signal.SIGKILL, flush_notifier=True)
 
     def _read(self, _fd: int) -> None:
         if self._fd is None:
@@ -144,11 +144,14 @@ class TerminalSession(QObject):
             code = os.waitstatus_to_exitcode(status) if status else 0
             self._finish(code)
 
-    def _finish(self, code: int) -> None:
+    def _finish(self, code: int, *, flush_notifier: bool = False) -> None:
         if self._notifier is not None:
-            self._notifier.setEnabled(False)
-            self._notifier.deleteLater()
+            notifier = self._notifier
+            notifier.setEnabled(False)
+            notifier.deleteLater()
             self._notifier = None
+            if flush_notifier:
+                QCoreApplication.sendPostedEvents(notifier, QEvent.Type.DeferredDelete)
         if self._fd is not None:
             try:
                 os.close(self._fd)
