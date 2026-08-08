@@ -11,6 +11,101 @@ from pathlib import Path
 from PySide6.QtCore import QCoreApplication, QEvent, QSocketNotifier, QTimer, QObject, Signal
 
 
+class TerminalOutputFilter:
+    """Convert PTY output into text that a plain Qt editor can display safely.
+
+    A PTY emits terminal control sequences for colors, bracketed paste mode,
+    terminal titles, and cursor handling.  ``QPlainTextEdit`` is not a
+    terminal emulator, so those sequences must be consumed before insertion.
+    The parser keeps incomplete sequences between reads because a single
+    ``os.read`` is allowed to split an escape sequence at any byte.
+    """
+
+    _STRING_ESCAPES = frozenset("PX^_")
+    _STRING_C1_ESCAPES = frozenset("\x90\x98\x9e\x9f")
+
+    def __init__(self) -> None:
+        self._pending = ""
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+        data = self._pending + text
+        self._pending = ""
+        rendered: list[str] = []
+        index = 0
+        while index < len(data):
+            char = data[index]
+            if char == "\x1b":
+                end = self._consume_esc(data, index)
+                if end is None:
+                    self._pending = data[index:]
+                    break
+                index = end
+                continue
+            if char in {"\x9b", "\x9d", *self._STRING_C1_ESCAPES}:
+                end = self._consume_c1(data, index)
+                if end is None:
+                    self._pending = data[index:]
+                    break
+                index = end
+                continue
+            codepoint = ord(char)
+            if char == "\n" or char == "\t":
+                rendered.append(char)
+            elif char == "\r" or codepoint < 0x20 or codepoint == 0x7F:
+                # QPlainTextEdit cannot emulate carriage-return updates,
+                # backspace, BEL, or other C0 controls.  Dropping them keeps
+                # shell output readable and, importantly, never displays a
+                # replacement square for a control byte.
+                pass
+            else:
+                rendered.append(char)
+            index += 1
+        return "".join(rendered)
+
+    def _consume_esc(self, data: str, index: int) -> int | None:
+        marker_index = index + 1
+        if marker_index >= len(data):
+            return None
+        marker = data[marker_index]
+        if marker == "[":
+            return self._consume_csi(data, marker_index + 1)
+        if marker == "]" or marker in self._STRING_ESCAPES:
+            return self._consume_string(data, marker_index + 1)
+        # Two-byte ESC sequences such as save/restore cursor or reset.
+        return marker_index + 1
+
+    def _consume_c1(self, data: str, index: int) -> int | None:
+        char = data[index]
+        if char == "\x9b":
+            return self._consume_csi(data, index + 1)
+        return self._consume_string(data, index + 1)
+
+    @staticmethod
+    def _consume_csi(data: str, index: int) -> int | None:
+        for cursor in range(index, len(data)):
+            codepoint = ord(data[cursor])
+            if 0x40 <= codepoint <= 0x7E:
+                return cursor + 1
+        return None
+
+    @staticmethod
+    def _consume_string(data: str, index: int) -> int | None:
+        cursor = index
+        while cursor < len(data):
+            char = data[cursor]
+            if char == "\x07" or char == "\x9c":
+                return cursor + 1
+            if char == "\x1b":
+                if cursor + 1 >= len(data):
+                    return None
+                if data[cursor + 1] == "\\":
+                    return cursor + 2
+            cursor += 1
+        return None
+
+
 class TerminalSession(QObject):
     """One Linux PTY shell whose cwd is fixed at construction time."""
 

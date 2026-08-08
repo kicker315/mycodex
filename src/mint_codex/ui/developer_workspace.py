@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 
 from mint_codex.workspace.file_access import FileAccessError, read_project_file
 from mint_codex.workspace.git_workspace import GitChange, GitDiffResult, GitStatusSnapshot, GitWorkspace
-from mint_codex.workspace.terminal import TerminalSession
+from mint_codex.workspace.terminal import TerminalOutputFilter, TerminalSession
 
 
 class DeveloperWorkspacePanel(QWidget):
@@ -36,6 +36,7 @@ class DeveloperWorkspacePanel(QWidget):
         self._context_key: str | None = None
         self._changes: dict[str, GitChange] = {}
         self._terminals: dict[str, TerminalSession] = {}
+        self._terminal_filters: dict[str, TerminalOutputFilter] = {}
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.setInterval(250)
@@ -274,6 +275,7 @@ class DeveloperWorkspacePanel(QWidget):
         if terminal is None:
             terminal = TerminalSession(self._root, self)
             self._terminals[key] = terminal
+            self._terminal_filters[key] = TerminalOutputFilter()
             terminal.output.connect(lambda text, terminal_key=key: self._terminal_output(terminal_key, text))
             terminal.state_changed.connect(lambda state, terminal_key=key: self._terminal_state(terminal_key, state))
             terminal.error.connect(lambda message, terminal_key=key: self._terminal_error_for(terminal_key, message))
@@ -307,7 +309,10 @@ class DeveloperWorkspacePanel(QWidget):
 
     def _terminal_output(self, key: str, text: str) -> None:
         if key == self._context_key:
-            self.terminal_output.insertPlainText(text)
+            output_filter = self._terminal_filters.setdefault(key, TerminalOutputFilter())
+            rendered = output_filter.feed(text)
+            if rendered:
+                self.terminal_output.insertPlainText(rendered)
 
     def _terminal_state(self, key: str, state: str) -> None:
         if key == self._context_key:
@@ -324,6 +329,7 @@ class DeveloperWorkspacePanel(QWidget):
             self._terminals.pop(self._context_key or "", None)
             terminal.deleteLater()
             QCoreApplication.sendPostedEvents(terminal, QEvent.Type.DeferredDelete)
+            self._terminal_filters.pop(self._context_key or "", None)
         self.terminal_output.clear()
         self.terminal_start.setEnabled(True)
         self.terminal_interrupt.setEnabled(False)
@@ -335,6 +341,7 @@ class DeveloperWorkspacePanel(QWidget):
             terminal.deleteLater()
             QCoreApplication.sendPostedEvents(terminal, QEvent.Type.DeferredDelete)
         self._terminals.clear()
+        self._terminal_filters.clear()
         self.git.close()
 
     def _find_change(self, path: str) -> GitChange | None:
